@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Bus Tracker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { font-family: sans-serif; padding: 15px; background: #f5f5f5; margin: 0; }
+    .bus-card { border: 1px solid #ccc; border-radius: 10px; padding: 15px; margin-bottom: 15px; background: white; }
+    .distance { font-size: 26px; font-weight: bold; color: #2b6cb0; }
+    .status { color: #555; font-size: 14px; margin-top: 8px; }
+    .context { font-size: 16px; color: #d97706; font-weight: 600; }
+    h2 { color: #222; margin-top: 0; }
+    #map { height: 300px; border-radius: 10px; margin-top: 10px; }
+    button { padding: 10px 16px; border-radius: 8px; border: none; background: #2b6cb0; color: white; font-size: 14px; margin-top: 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>🚌 Bus Tracker — TN18BS4750</h2>
+
+  <div class="bus-card">
+    <p class="context" id="context"></p>
+    <p class="distance" id="distance">Waiting...</p>
+    <p class="status" id="status"></p>
+    <button onclick="enableAudio()">🔔 Enable Sound Alerts (tap once)</button>
+    <div id="map"></div>
+  </div>
+
+  <!-- Alert sound (short beep, base64 embedded so no external file needed) -->
+  <audio id="alertSound" src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" preload="auto"></audio>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ================== CONFIG ==================
+    const ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxNzgwNTUwOTQ3MTc4IiwiaXNzIjoiZ3BzLXRyYWNrZXIiLCJpYXQiOjE3ODA1NTA5NDd9.hoTGi8cdtEa32OIQQj7lZufluZO1SYqx9XBLPHTSi4g";
+    const API_URL = `https://live1.tpgpstrack.com/api/liveLocation/getDevicesInfo?accessToken=${ACCESS_TOKEN}`;
+
+    const BUS_NAME = "TN18BS4750";
+    const DESTINATION = { lat: 12.906984286041641, lng: 80.1830500017022 };
+
+    const POLL_INTERVAL_MS = 5000;
+    const THRESHOLDS = [1000, 700, 500];
+    const ARRIVAL_RADIUS = 50;
+
+    let alertsSent = new Set();
+    let currentWindowKey = null;
+    let audioEnabled = false;
+
+    if (Notification.permission !== "granted") {
+      Notification.requestPermission();
+    }
+
+    // ================== AUDIO UNLOCK (mobile browsers require a tap first) ==================
+    function enableAudio() {
+      const sound = document.getElementById("alertSound");
+      sound.play().then(() => {
+        sound.pause();
+        sound.currentTime = 0;
+        audioEnabled = true;
+        alert("Sound alerts enabled!");
+      }).catch(() => {
+        alert("Could not enable sound. Try tapping again.");
+      });
+    }
+
+    function playAlertSound() {
+      if (audioEnabled) {
+        const sound = document.getElementById("alertSound");
+        sound.currentTime = 0;
+        sound.play().catch(() => {});
+      }
+    }
+
+    // ================== TIME WINDOW LOGIC ==================
+    function getCurrentContext() {
+      const now = new Date();
+      const mins = now.getHours() * 60 + now.getMinutes();
+
+      const pickupStart = 7 * 60, pickupEnd = 8 * 60 + 15;
+      const youngerStart = 14 * 60 + 15, youngerEnd = 15 * 60 + 15;
+      const elderStart = 15 * 60 + 15, elderEnd = 16 * 60 + 15;
+
+      if (mins >= pickupStart && mins <= pickupEnd) {
+        return { key: "pickup", label: "🎒 Morning Pickup (Both Kids)" };
+      } else if (mins >= youngerStart && mins <= youngerEnd) {
+        return { key: "younger-drop", label: "🏠 Afternoon Drop — Younger Son" };
+      } else if (mins >= elderStart && mins <= elderEnd) {
+        return { key: "elder-drop", label: "🏠 Afternoon Drop — Elder Son" };
+      } else {
+        return { key: "idle", label: "No active trip window right now" };
+      }
+    }
+
+    // ================== REMINDER SCHEDULER ==================
+    // Fires a browser notification a few minutes BEFORE each window starts,
+    // so you remember to have the app open and screen on.
+    const reminderTimes = [
+      { hour: 6, min: 55, label: "Morning pickup starting soon — open Bus Tracker!" },
+      { hour: 14, min: 10, label: "Younger son's drop window starting soon!" },
+      { hour: 15, min: 10, label: "Elder son's drop window starting soon!" }
+    ];
+    let remindersFiredToday = new Set();
+
+    function checkReminders() {
+      const now = new Date();
+      const key = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+      const mins = now.getHours() * 60 + now.getMinutes();
+
+      reminderTimes.forEach(r => {
+        const reminderKey = `${key}-${r.hour}-${r.min}`;
+        const rMins = r.hour * 60 + r.min;
+        if (mins === rMins && !remindersFiredToday.has(reminderKey)) {
+          if (Notification.permission === "granted") {
+            new Notification("⏰ Bus Tracker Reminder", { body: r.label });
+          }
+          playAlertSound();
+          remindersFiredToday.add(reminderKey);
+        }
+      });
+    }
+
+    // ================== DISTANCE CALC (Haversine) ==================
+    function getDistanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = (deg) => deg * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2) ** 2 +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLon/2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    function sendAlert(contextLabel, message) {
+      if (Notification.permission === "granted") {
+        new Notification(`🚌 ${contextLabel}`, { body: message });
+      }
+      if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+      playAlertSound();
+    }
+
+    // ================== MAP SETUP ==================
+    const map = L.map('map').setView([DESTINATION.lat, DESTINATION.lng], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const homeIcon = L.divIcon({ html: "🏠", iconSize: [30, 30], className: "" });
+    const busIcon = L.divIcon({ html: "🚌", iconSize: [30, 30], className: "" });
+
+    L.marker([DESTINATION.lat, DESTINATION.lng], { icon: homeIcon }).addTo(map).bindPopup("Home / School");
+    let busMarker = null;
+
+    function updateMap(lat, lng) {
+      if (!busMarker) {
+        busMarker = L.marker([lat, lng], { icon: busIcon }).addTo(map).bindPopup("Bus");
+      } else {
+        busMarker.setLatLng([lat, lng]);
+      }
+    }
+
+    // ================== API CALL ==================
+    async function fetchBusLocation() {
+      try {
+        const res = await fetch(API_URL);
+        const data = await res.json();
+        if (!data.successful) {
+          console.error("API error:", data.message);
+          return null;
+        }
+        return data.object.find(d => d.name === BUS_NAME);
+      } catch (err) {
+        console.error("Error fetching bus location:", err);
+        return null;
+      }
+    }
+
+    // ================== MAIN LOOP ==================
+    async function checkBus() {
+      checkReminders();
+
+      const context = getCurrentContext();
+      document.getElementById("context").innerText = context.label;
+
+      if (context.key !== currentWindowKey) {
+        alertsSent = new Set();
+        currentWindowKey = context.key;
+      }
+
+      if (context.key === "idle") {
+        document.getElementById("distance").innerText = "—";
+        document.getElementById("status").innerText = "Outside pickup/drop hours";
+        return;
+      }
+
+      const device = await fetchBusLocation();
+      if (!device) {
+        document.getElementById("status").innerText = "Bus not found in feed";
+        return;
+      }
+
+      const distance = getDistanceMeters(
+        device.latitude, device.longitude,
+        DESTINATION.lat, DESTINATION.lng
+      );
+
+      document.getElementById("distance").innerText = `${Math.round(distance)} meters away`;
+      document.getElementById("status").innerText =
+        `Status: ${device.attributes?.currentStatus || "?"} | Speed: ${device.speed} km/h | GPS time: ${new Date(device.fixTime).toLocaleTimeString()}`;
+
+      updateMap(device.latitude, device.longitude);
+      map.panTo([device.latitude, device.longitude]);
+
+      for (const threshold of THRESHOLDS) {
+        if (distance <= threshold && !alertsSent.has(threshold)) {
+          sendAlert(context.label, `Bus is within ${threshold} meters!`);
+          alertsSent.add(threshold);
+        }
+      }
+
+      if (distance <= ARRIVAL_RADIUS && !alertsSent.has("arrived")) {
+        sendAlert(context.label, "Bus has arrived!");
+        alertsSent.add("arrived");
+      }
+    }
+
+    setInterval(checkBus, POLL_INTERVAL_MS);
+    checkBus();
+  </script>
+</body>
+</html>
